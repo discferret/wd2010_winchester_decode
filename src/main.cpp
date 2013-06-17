@@ -671,9 +671,9 @@ int main(int argc, char **argv)
 		// get next bit
 		bits = ((bits << 1) + (mfmbits[i] ? 1 : 0)) & 0xffffffff;
 
-		// compare buffer with sync-longword (sync-A1 : FE, aka IDAM)
-		if ((bits & 0xffffFF30) == 0x44895510) {
-			// ID Address Mark
+		// Scan the last 32 MFM-bits (16 data bits) for an MFM pattern we recognise
+		if ((bits & 0xffffFF30) == 0x44895510) {	// Sync-A1, 0b1111_x1xx ==> IDAM  (x=don't care)
+			// ID Address Mark (IDAM)
 			// i+1 because "i" is the last bit of the IDAM marker; we want the
 			// first bit of the new data byte (encoded word).
 			printf("IDAM at %lu\n", i+1);
@@ -687,8 +687,26 @@ int main(int argc, char **argv)
 				idambuf[x] = decodeMFM(mfmbits, i+(x*16)+1);
 			}
 
-			printf("\tIDAM = Cylinder_Low %2d, Head %d, Sector %2d; %s; sector size ",
-					idambuf[0], idambuf[1] & 0x07, idambuf[2],
+			// Decode Cylinder from IDENT byte and Cyl_Lo
+			// (the three upper bits are stored in IDENT, rest are in CYL_LO)
+			// Ref: WD2010-05 datasheet page 3-130, Western Digital
+			unsigned int cylinder = 0;
+			cylinder = decodeMFM(mfmbits, i-15);
+			switch (cylinder) {
+				case 0xFE:	cylinder = 0;    break;
+				case 0xFF:	cylinder = 256;  break;
+				case 0xFC:	cylinder = 512;  break;
+				case 0xFD:	cylinder = 768;  break;
+				case 0xF6:	cylinder = 1024; break;
+				case 0xF7:	cylinder = 1280; break;
+				case 0xF4:	cylinder = 1536; break;
+				case 0xF5:	cylinder = 1792; break;
+				default:	cylinder = 0;			// TODO flag error?
+			}
+			cylinder += static_cast<unsigned int>(idambuf[0]);
+
+			printf("\tIDAM = Cylinder %4d, Head %d, Sector %2d; %s; sector size ",
+					cylinder, idambuf[1] & 0x07, idambuf[2],
 					(idambuf[1] & 0x80) ? "BAD BLOCK" : "ok  block");
 			switch ((idambuf[1] >> 5) & 0x03) {
 				case 0x00:
@@ -719,7 +737,7 @@ int main(int argc, char **argv)
 			printf("; CRC=%04X (calc'd %04X) %s\n", got_crc, crc, (got_crc==crc) ? "(ok)" : "BAD");
 
 			delete idambuf;
-		} else if ((bits & 0xffffffff) == 0x4489554A) {
+		} else if ((bits & 0xffffffff) == 0x4489554A) {		// Sync-A1, 0xF8 ==> DAM
 			// Data Address Mark
 			// i+1 because "i" is the last bit of the DAM marker; we want the
 			// first bit of the new data byte (encoded word).
@@ -737,11 +755,12 @@ int main(int argc, char **argv)
 			// the first bit of the new data byte (encoded word).
 			//
 			unsigned char *buffer = new unsigned char[dump+2];
-			for (size_t x=0; x<dump+6; x++) {
+			const size_t EXTRA=6*0;
+			for (size_t x=0; x<dump+EXTRA; x++) {
 				buffer[x] = decodeMFM(mfmbits, i+(x*16)+1);
 			}
-			hex_dump(buffer, dump+6);
-			dump_array(buffer, dump+6);
+			hex_dump(buffer, dump+EXTRA);
+			dump_array(buffer, dump+EXTRA);
 
 			if (chk_data_crc) {
 				CRC16 c = CRC16();
