@@ -1,4 +1,5 @@
 #include <iostream>
+#include <fstream>
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
@@ -75,65 +76,135 @@ class CRC16 {
 		}
 };
 
-// Load a track image from a file
-// TODO: rewrite this using fstream
-size_t LoadTrackImage(const char *filename, unsigned int *buffer)
-{
-	FILE *fp;
-	size_t filelen;
-	char *buf;
-	numeric_limits<unsigned int> int_limits;
+/////////////////////////////////////////////////////////////////////////////
 
+class DiscFerretImage {
+	private:
+		ifstream file;
+		size_t file_len;
+		int file_version;
+	public:
+		DiscFerretImage(const char *filename);
+		void NextTrack(vector<int> &timings, vector<int> &indexes, unsigned int &cyl, unsigned int &head, unsigned int &sec);
+};
+
+DiscFerretImage::DiscFerretImage(const char *filename)
+{
 	// open the file
-	fp=fopen(filename, "rb");
-	if (!fp) return -1;
+	file.exceptions(ifstream::failbit | ifstream::badbit);
+	file.open(filename, ios::in | ios::binary);
 
 	// find out how big the file is
-	fseek(fp, 0, SEEK_END);
-	filelen = ftell(fp);
-	fseek(fp, 0, SEEK_SET);
+	file.seekg(0, ios::end);
+	file_len = file.tellg();
+	file.seekg(0, ios::beg);
 
-	// read entire file into RAM
-	if ((buf = new char[filelen]) == NULL) return -1;
-	if (fread(buf, 1, filelen, fp) != filelen) return -1;
-
-	// iterate over loop, build timing values
-	// This is a little more involved than just copying from one buffer to
-	// another. The DA100 will store a '0x00' byte every time the delay
-	// counter wraps around (from 127 to 0). Thus, we maintain a carry count
-	// (incremented by 128 for each zero byte) which is added onto the next
-	// non-zero byte. We also track instances where carrying the value would
-	// cause an integer overflow in the data storage buffer -- this causes
-	// the function to return -1.
-	unsigned int carry = 0;
-	size_t count = 0;
-	for (size_t s = 0; s < filelen; s++) {
-		// check for counter overflow from DA
-		if ((buf[s] & 127) == 0) {
-			// counter overflow, increase the carry register
-			if ((((unsigned long)carry) + 128) > int_limits.max()) {
-				// detected data overflow
-				delete[] buf;
-				return -1;
-			} else {
-				// otherwise keep carrying
-				carry += 128;
-			}
-		} else {
-			// no overflow, just a normal count. store the count and clear
-			// the carry counter.
-			buffer[count++] = carry + (buf[s] & 127);
-			carry = 0;
-		}
+	// read magic number
+	char mnum[4];
+	file.read(mnum, 4);
+	if ((mnum[0] != 'D') || (mnum[1] != 'F') || (mnum[2] != 'E')) {
+		printf("ERROR: File has bad magic!\n");
+		throw exception();
 	}
 
-	// free the file buffer
-	delete[] buf;
-
-	fclose(fp);
-
-	return count;
+	switch (mnum[3]) {
+		case 'R':
+			file_version = 1;
+			printf("WARNING: This is an old-format DiscFerret image. The data stream may contain invalid data and should not be trusted.\n");
+			break;
+		case '2':
+			file_version = 2;
+			break;
+		default:
+			printf("ERROR: File has bad magic!\n");
+			throw exception();
+	}
 }
+
+void DiscFerretImage::NextTrack(vector<int> &timings, vector<int> &indexes, unsigned int &cyl, unsigned int &head, unsigned int &sec)
+{
+	uint8_t hdr[10];
+	uint32_t plen;
+
+	// Read the track header
+	file.read((char *)hdr, 10);
+	cyl  = ((uint16_t)hdr[0] << 8) + (uint16_t)hdr[1];
+	head = ((uint16_t)hdr[2] << 8) + (uint16_t)hdr[3];
+	sec  = ((uint16_t)hdr[4] << 8) + (uint16_t)hdr[5];
+	plen = ((uint32_t)hdr[6] << 24) +
+		((uint32_t)hdr[7] << 16) +
+		((uint32_t)hdr[8] << 8) +
+		(uint16_t)hdr[9];
+
+	// Make sure payload length is sane
+	if (plen > (file_len - file.tellg())) {
+		throw exception();
+	}
+
+	// Read trackdata into a buffer and decode
+	uint8_t *tbuf = new uint8_t[plen];
+	file.read(reinterpret_cast<char *>(tbuf), plen);
+
+	// Carry and current absolute time offset
+	uint32_t carry = 0, cur_t = 0;
+
+	// Clear the output buffers
+	indexes.clear();
+	timings.clear();
+
+	if (file_version == 1) {
+		// Old-style DFER image
+		carry = 0;
+		for (streampos i=0; i<plen; i+=1) {
+			uint8_t d = tbuf[i] & 0x7f;
+
+			if (tbuf[i] & 0x80) {
+				// MSBit set - index pulse
+				indexes.push_back(cur_t + carry + static_cast<uint32_t>(d));
+			}
+
+			if (d == 0) {
+				// timing value == 0 --> carry
+				carry += 127;
+			} else {
+				// timing value != 0 --> timing tick
+				timings.push_back(carry + static_cast<uint32_t>(d));
+				carry = 0;
+			}
+		}
+	} else if (file_version == 2) {
+		// New-style DFE2 image
+		carry = cur_t = 0;
+
+		for (streampos i=0; i<plen; i+=1) {
+			uint8_t d = tbuf[i] & 0x7f;
+
+			if (d == 0x7F) {
+				// Lower 7 bit value == 0x7F --> there was a carry
+				carry += 127;
+				cur_t += 127;
+			} else if (tbuf[i] & 0x80) {
+				// MSbit set --> index store
+				carry += d;
+				cur_t += d;
+				indexes.push_back(cur_t);
+			} else {
+				// MSbit clear and not an index store - must be a timing store
+				timings.push_back(carry + static_cast<uint32_t>(d));
+				cur_t += d;
+				carry = 0;
+			}
+		}
+
+		// Carry may be nonzero at this point. If that is the case, we have
+		// only captured part of a transition and we should ignore it, not
+		// add it to the data buffer (which will cause corruption).
+	} else {
+		// No idea what happened here... don't recognise this file version.
+		throw exception();
+	}
+}
+
 
 // Decode 16 MFM bits into a single byte
 unsigned char decodeMFM(vector<bool> bits, size_t startpos)
@@ -152,6 +223,23 @@ unsigned char decodeMFM(vector<bool> bits, size_t startpos)
 	return buf;
 }
 
+void dump_array(unsigned char *d, size_t len)
+{
+#if 0
+	int i=0;
+
+	printf("unsigned char data_array[] = {\n");
+	while (len > 0) {
+		printf("0x%02X%s", *(d++), (len-->1)?", ":"");
+		if (i++ == 15) {
+			printf("\n");
+			i=0;
+		}
+	}
+	printf("%s};\n", i>0?"\n":"");
+#endif
+}
+
 // main fnc
 int main(int argc, char **argv)
 {
@@ -167,13 +255,19 @@ int main(int argc, char **argv)
 
 	// limit scope of 'x'
 	{
-		ssize_t x = LoadTrackImage(argv[1], buf);
-		if (x < 1) {
-			cout << "error reading input file \"" << argv[1] << "\"\n";
-			return -1;
+		DiscFerretImage dfi(argv[1]);
+
+		vector<int> timing, index;
+		unsigned int cyl, head, sec;
+
+		dfi.NextTrack(timing, index, cyl, head, sec);
+
+		buflen = timing.size();
+		for (size_t x=0; x<buflen; x++) {
+			buf[x] = timing[x];
 		}
-		buflen = x;
-		printf("buflen = %lu\n", (unsigned long)buflen);
+
+		printf("DFI track CHS %u:%u:%u; buflen = %lu\n", cyl, head, sec, (unsigned long)buflen);
 	}
 
 	// calculate RPM and data rate
@@ -186,7 +280,8 @@ int main(int argc, char **argv)
 	printf("total timing val = %lu\n", buftm);
 	printf("time(secs) = %f\n", ((float)buftm) * 25e-9);
 	printf("time(ms) = %f\n", ((float)buftm) * 25e-9 * 1000);
-	printf("est rpm = %f\n", 60 * (1/(((float)buftm) * 25e-9)));
+	float nsecs_per_tick = 1.0/100.0e6;
+	printf("est rpm = %f\n", 60 * (1/(((float)buftm) * nsecs_per_tick)));
 	printf("\n");
 	printf("maxval = %lu\nminval = %lu\nspan   = %lu\n", maxval, minval, maxval - minval);
 	printf("\n");
@@ -466,16 +561,17 @@ int main(int argc, char **argv)
 	// Nanoseconds counters. Increment once per loop or "virtual" nanosecond.
 	unsigned long nsecs1 = 0, nsecs2=0;
 	// Number of nanoseconds per acq tick -- (1/freq)*1e9. This is valid for 40MHz.
-	const unsigned long NSECS_PER_ACQ = 50;
+	const unsigned long NSECS_PER_ACQ = (1e10 / 100e6);
 	// Number of nanoseconds per PLLCK tick -- (1/16e6)*1e9. 16MHz. 
 	// This should be the reciprocal of 32 times the data rate in kbps, multiplied
 	// by 1e9 to get the time in nanoseconds.
-	const unsigned long NSECS_PER_PLLCK = 125*2;
+	// That is, (1/(TRANSITIONS_PER_BITCELL * PJL_COUNTER_MAX * DATA_RATE))*1e9
+	const unsigned long NSECS_PER_PLLCK = (1e10 / 640e6);
 	// Number of clock increments per loop (timing granularity). Best-case value
 	// for this is gcd(NSECS_PER_ACQ, NSECS_PER_PLLCK).
-	const unsigned long TIMER_INCREMENT = 25;
+	const unsigned long TIMER_INCREMENT = 1;
 	// Maximum value of the PJL counter. Determines the granularity of phase changes.
-	const unsigned char PJL_COUNTER_MAX = 16;
+	const unsigned char PJL_COUNTER_MAX = 64;
 
 	// Iterator for data buffer
 	size_t i = 0;
@@ -576,46 +672,54 @@ int main(int argc, char **argv)
 		bits = ((bits << 1) + (mfmbits[i] ? 1 : 0)) & 0xffffffff;
 
 		// compare buffer with sync-longword (sync-A1 : FE, aka IDAM)
-		if (bits == 0x44895554) {
+		if ((bits & 0xffffFF30) == 0x44895510) {
 			// ID Address Mark
 			// i+1 because "i" is the last bit of the IDAM marker; we want the
 			// first bit of the new data byte (encoded word).
 			printf("IDAM at %lu\n", i+1);
 			num_idam++;
-			dump = 6;
+			dump = 5;
 			chk_data_crc = false;
 
 			// decode the IDAM
 			unsigned char *idambuf = new unsigned char[6];
-			for (size_t x=0; x<6; x++) {
+			for (size_t x=0; x<5; x++) {
 				idambuf[x] = decodeMFM(mfmbits, i+(x*16)+1);
 			}
 
-			printf("\tIDAM = Track %2d, Side %d, Sector %2d; sector size ",
-					idambuf[0], idambuf[1], idambuf[2]);
-			switch (idambuf[3]) {
+			printf("\tIDAM = Cylinder_Low %2d, Head %d, Sector %2d; %s; sector size ",
+					idambuf[0], idambuf[1] & 0x07, idambuf[2],
+					(idambuf[1] & 0x80) ? "BAD BLOCK" : "ok  block");
+			switch ((idambuf[1] >> 5) & 0x03) {
 				case 0x00:
+					next_data_dump = 256;
+					break;
 				case 0x01:
+					next_data_dump = 512;
+					break;
 				case 0x02:
+					next_data_dump = 1024;
+					break;
 				case 0x03:
-					printf("%d", 1 << (7+idambuf[3]));
-					next_data_dump = 1<<(7+idambuf[3]);
+					next_data_dump = 128;
 					break;
 				default:
-					printf("unknown (0x%02X)", idambuf[3]);
+					printf("unknown (0x%02X)", (idambuf[1] >> 5) & 0x03);
 					next_data_dump = 0;
 					break;
 			}
+			if (next_data_dump != 0) printf("%ld", next_data_dump);
 
 			// check the CRC
 			CRC16 c = CRC16();
-			c.update((char *)"\xA1\xA1\xA1\xFE", 4);
-			unsigned int crc = c.update(idambuf, 4);
-			printf("; CRC=%04X %s\n", (idambuf[4] << 8) | idambuf[5],
-					((unsigned int)((idambuf[4] << 8) | idambuf[5])==crc) ? "(ok)" : "BAD");
+			c.update((char *)"\xA1\xFE", 2);
+			unsigned int crc = c.update(idambuf, 3);
+			unsigned int got_crc = (idambuf[3] << 8) | idambuf[4];
+			printf("; RCRC=%04X", c.update(&idambuf[3], 2));
+			printf("; CRC=%04X (calc'd %04X) %s\n", got_crc, crc, (got_crc==crc) ? "(ok)" : "BAD");
 
 			delete idambuf;
-		} else if (bits == 0x44895545) {
+		} else if ((bits & 0xffffffff) == 0x4489554A) {
 			// Data Address Mark
 			// i+1 because "i" is the last bit of the DAM marker; we want the
 			// first bit of the new data byte (encoded word).
@@ -633,16 +737,18 @@ int main(int argc, char **argv)
 			// the first bit of the new data byte (encoded word).
 			//
 			unsigned char *buffer = new unsigned char[dump+2];
-			for (size_t x=0; x<dump+2; x++) {
+			for (size_t x=0; x<dump+6; x++) {
 				buffer[x] = decodeMFM(mfmbits, i+(x*16)+1);
 			}
-			hex_dump(buffer, dump);
+			hex_dump(buffer, dump+6);
+			dump_array(buffer, dump+6);
 
 			if (chk_data_crc) {
 				CRC16 c = CRC16();
-				c.update((char *)"\xA1\xA1\xA1\xFB", 4);
+				c.update((char *)"\xA1\xF8", 2);
 				unsigned int crc = c.update(buffer, dump);
-				printf("\tData record CRC=%04X %s\n", (buffer[dump+0] << 8) | buffer[dump+1],
+				printf("\tData record CRC=%04X (calc'd %04X) %s\n", (buffer[dump+0] << 8) | buffer[dump+1],
+						crc,
 						((unsigned int)((buffer[dump+0] << 8) | buffer[dump+1])==crc) ? "(ok)" : "BAD");
 			}
 
