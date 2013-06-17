@@ -240,36 +240,9 @@ void dump_array(unsigned char *d, size_t len)
 #endif
 }
 
-// main fnc
-int main(int argc, char **argv)
+// data separator -- PJL
+void DataSeparate_PJL(vector<bool> &mfmbits, const unsigned int *const buf, const size_t buflen)
 {
-	unsigned int buf[128*1024];
-	size_t buflen;
-
-	if (argc < 2) {
-		cout << "syntax: " << argv[0] << " filename\n";
-		return -1;
-	}
-
-	// limit scope of 'x'
-	{
-		DiscFerretImage dfi(argv[1]);
-
-		vector<int> timing, index;
-		unsigned int cyl, head, sec;
-
-		dfi.NextTrack(timing, index, cyl, head, sec);
-
-		buflen = timing.size();
-		for (size_t x=0; x<buflen; x++) {
-			buf[x] = timing[x];
-		}
-
-		printf("DFI track CHS %u:%u:%u; buflen = %lu\n", cyl, head, sec, (unsigned long)buflen);
-	}
-
-	// Data separator begins here.
-	vector<bool> mfmbits;
 #ifdef VCD
 	FILE *vcd = fopen("values.vcd", "wt");
 	fprintf(vcd, "$version DiscFerret Analyser D2/DPLL 0.1 $end\n"
@@ -430,6 +403,40 @@ int main(int argc, char **argv)
 #ifdef VCD
 	fclose(vcd);
 #endif
+}
+
+
+// main fnc
+int main(int argc, char **argv)
+{
+	unsigned int buf[128*1024];
+	size_t buflen;
+
+	if (argc < 2) {
+		cout << "syntax: " << argv[0] << " filename\n";
+		return -1;
+	}
+
+	// limit scope of 'x'
+	{
+		DiscFerretImage dfi(argv[1]);
+
+		vector<int> timing, index;
+		unsigned int cyl, head, sec;
+
+		dfi.NextTrack(timing, index, cyl, head, sec);
+
+		buflen = timing.size();
+		for (size_t x=0; x<buflen; x++) {
+			buf[x] = timing[x];
+		}
+
+		printf("DFI track CHS %u:%u:%u; buflen = %lu\n", cyl, head, sec, (unsigned long)buflen);
+	}
+
+	// Data separator begins here.
+	vector<bool> mfmbits;
+	DataSeparate_PJL(mfmbits, buf, buflen);
 
 	printf("mfmbits count = %lu\n", mfmbits.size());
 
