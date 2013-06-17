@@ -245,8 +245,6 @@ int main(int argc, char **argv)
 {
 	unsigned int buf[128*1024];
 	size_t buflen;
-	size_t maxval = 0;
-	size_t minval = ((size_t)-1);
 
 	if (argc < 2) {
 		cout << "syntax: " << argv[0] << " filename\n";
@@ -270,232 +268,8 @@ int main(int argc, char **argv)
 		printf("DFI track CHS %u:%u:%u; buflen = %lu\n", cyl, head, sec, (unsigned long)buflen);
 	}
 
-	// calculate RPM and data rate
-	unsigned long buftm = 0;
-	for (size_t i=0; i<buflen; i++) {
-		buftm += buf[i];
-		if (maxval < buf[i]) maxval = buf[i];
-		if (minval > buf[i]) minval = buf[i];
-	}
-	printf("total timing val = %lu\n", buftm);
-	printf("time(secs) = %f\n", ((float)buftm) * 25e-9);
-	printf("time(ms) = %f\n", ((float)buftm) * 25e-9 * 1000);
-	float nsecs_per_tick = 1.0/100.0e6;
-	printf("est rpm = %f\n", 60 * (1/(((float)buftm) * nsecs_per_tick)));
-	printf("\n");
-	printf("maxval = %lu\nminval = %lu\nspan   = %lu\n", maxval, minval, maxval - minval);
-	printf("\n");
-
-	// allocate memory for a histogram
-	// note that we only allocate memory for 'bins' inside the min-max range
-	// calculated above. this saves a bit of memory.
-	unsigned int *histogram = new unsigned int[maxval - minval + 1];
-	for (size_t i=0; i<=(maxval-minval); i++) histogram[i] = 0;
-
-	// generate the histogram
-	for (size_t i=0; i<buflen; i++) {
-		histogram[buf[i] - minval]++;
-	}
-
-	// Calculate the mean value of the histogram
-	float mean = 0;
-	for (size_t i=0; i<=(maxval-minval); i++) {
-		mean += histogram[i];
-	}
-	mean /= ((maxval - minval) + 1);
-	printf("mean = %0.5f\n", mean);
-
-	// Calculate the standard deviation
-	float sd = 0, osqr = 0;
-	for (size_t i=0; i<=(maxval - minval); i++) {
-		// calculate deviation from mean
-		sd = histogram[i] - mean;
-		// square the deviation
-		sd = sd * sd;
-		// add to the variance accumulator
-		osqr += sd;
-	}
-
-	// Calculate the mean variance
-	osqr /= ((float)(maxval - minval + 1));
-
-	printf("o^2 (mean variance) = %0.2f\n", osqr);
-
-	// Take the square root of the variance to get the standard deviation
-	printf("standard deviation = %0.4f\n", sqrtf(osqr));
-
-#if 0
-	// DEBUG: print out the histogram
-	printf("histpoint,time,count\n");
-	for (size_t i=0; i<=(maxval - minval); i++) {
-		// calculate time in microseconds
-		// one count is 1/(40e6) seconds; mul by 1e6 to get usecs
-		float t = ((i+minval)*(1.0/40.0e6)) * 1.0e6;
-		printf("%d,%0.2f,%d\n", i+minval, t, histogram[i]);
-	}
-#endif
-
-	// Apply a moving average to the histogram data
-	// This eliminates small spikes in the data set, and makes the peak detection
-	// a bit more reliable.
-
-	do {
-		// Start by making a copy of the original histogram
-		unsigned int *histogram_copy = new unsigned int[maxval - minval + 1];
-		for (size_t z=0; z<(maxval-minval+1); z++) histogram_copy[z] = histogram[z];
-
-		// Number of previous values to take into account
-		const int HIST_PKDET_AVG_BINS = 16;
-
-		// Apply moving average to histogram data
-		for (size_t x=1; x<(maxval-minval+1); x++) {
-			unsigned long accum = 0;
-			unsigned int n = 0;
-			for (ssize_t y=(x-HIST_PKDET_AVG_BINS); y<(ssize_t)x; y++) {
-				if (y>=0) {
-					accum += histogram_copy[y];
-					n++;
-				}
-			}
-			if (n>0) accum /= n; else accum = 0;
-			histogram[x] = accum;
-		}
-
-		delete[] histogram_copy;
-	} while (0);
-
-	// Clip histogram noise. Need to find outliers, then eliminate them.
-	// For now, just throw away anything with a count less than 1/10th of the mean.
-	for (size_t i=0; i<=(maxval-minval); i++) {
-		if (histogram[i] < round(mean * 0.1)) histogram[i] = 0;
-	}
-
-#if 0
-	// DEBUG: print out the clipped histogram
-	printf("histpoint\ttime\tcount\n");
-	for (size_t i=0; i<=(maxval - minval); i++) {
-		// calculate time in microseconds
-		// one count is 1/(40e6) seconds; mul by 1e6 to get usecs
-		float t = ((i+minval)*(1.0/40.0e6)) * 1.0e6;
-		printf("%d\t%0.2f\t%d\n", i+minval, t, histogram[i]);
-	}
-#endif
-
-	// Peaks are found by measuring the slope of the current and previous histogram
-	// points. To put it another way:
-	//           (y1-y2)          change in y
-	//  slope = ---------  or  = -------------
-	//           (x1-x2)          change in x
-	//
-	// X is the "time" axis (i+minval, or just i), Y is the "count" axis
-	// (histogram[i]).
-	//
-	// Last histogram value
-	size_t lasthist = histogram[0];
-	// Last delta (dY/dX)
-	ssize_t lastdelta = 0;
-	// Positions of detected peaks
-	size_t peaks[32];
-	// Number of detected peaks
-	size_t numpeaks = 0;
-	for (size_t i=1; i<=(maxval - minval); i++) {
-		// break if max number of peaks has been exceeded
-		if (numpeaks > (sizeof(peaks)/sizeof(peaks[0]))) {
-			printf("WARNING: Maximum number of peaks exceeded!\n");
-			break;
-		}
-
-		// calculate delta
-		ssize_t delta = histogram[i] - lasthist;
-
-		// if this delta is negative and last delta was positive then we've
-		// found a peak. Note that the peak is actually in the last histogram
-		// 'bin'; we're on a negative slope here, thus the 'last' point was
-		// the highest point (peak) as far as we're concerned.
-		if ((delta <= 0) && (lastdelta > 0)) {
-			peaks[numpeaks++] = i-1;
-		}
-
-		// Update last-histogram-point and last-delta
-		lasthist = histogram[i];
-		lastdelta = delta;
-	}
-
-	// List all found peaks
-	if (numpeaks > 0) {
-		printf("%lu peaks found:\n", numpeaks);
-		for (size_t i=0; i<numpeaks; i++) {
-			printf("\tpeak #%lu: %3lu\n", i+1, peaks[i]+minval);
-		}
-	} else {
-		printf("No peaks found.\n");
-	}
-
-	// Loop over the peaks and see if we have a cluster which are close to the
-	// 1t:1.5t:2t profile of MFM.
-	//
-	// TODO: implement this
-
-	// Basically, we:
-	//   - Start at 1.5t and work backwards (and forwards) up to 1t.
-	//   - Store the position of the closest peak to 1.5t
-	//   - Repeat for 2t
-	//
-	// The decoder algorithm doesn't need to know where the peaks are, but we
-	// can use peak-position testing as part of the Confidence Value
-	// calculation. That is, "how confident are we that this really is MFM data?"
-	//
-	// Note that the MFM CODEC ideally needs to know where the 1t peak is during
-	// initialisation. Otherwise we need to know the data rate and sample rate,
-	// and set it to a sane default.
-	//
-	// Also note that the MFM CODEC can handle FM too. So a 2-peak (1t:2t)
-	// histogram is a valid FM histogram, and a 3-peak (1t:1.5t:2t) histogram
-	// is a valid MFM histogram.
-
-	// Bit-vector to store MFM stream
+	// Data separator begins here.
 	vector<bool> mfmbits;
-
-	// Data decoder begins here.
-#if 0
-	// Current 1t reference. Assumed to be the position of the 1st peak.
-	float t = peaks[0] + minval;
-
-	// Iterate over input stream and decode
-	const float change_frac = 0.05;
-	for (size_t i=0; i<buflen; i++) {
-		// Calculate error values for this timing value vs. 1t, 1.5t and 2.0t
-		float error_t10 = fabs((buf[i] / 1.0) - t);
-		float error_t15 = fabs((buf[i] / 1.5) - t);
-		float error_t20 = fabs((buf[i] / 2.0) - t);
-		float t_mult;
-
-		// Figure out which error is the lowest
-		if ((error_t10 < error_t15) && (error_t10 < error_t20)) {
-			// t1.0 is the lowest. "01" sequence.
-			mfmbits.push_back(false);
-			mfmbits.push_back(true);
-			t_mult = 1.0;
-		} else if ((error_t15 < error_t10) && (error_t15 < error_t20)) {
-			// t1.5 is the lowest. "001" sequence.
-			mfmbits.push_back(false);
-			mfmbits.push_back(false);
-			mfmbits.push_back(true);
-			t_mult = 1.5;
-		} else {
-			// t2.0 is the lowest. "0001" sequence.
-			mfmbits.push_back(false);
-			mfmbits.push_back(false);
-			mfmbits.push_back(false);
-			mfmbits.push_back(true);
-			t_mult = 2.0;
-		}
-
-		// Update reference T
-		t = ((1.0 - change_frac) * t) + (change_frac * ((float)buf[i] / t_mult));
-	}
-#else
-
 #ifdef VCD
 	FILE *vcd = fopen("values.vcd", "wt");
 	fprintf(vcd, "$version DiscFerret Analyser D2/DPLL 0.1 $end\n"
@@ -656,9 +430,8 @@ int main(int argc, char **argv)
 #ifdef VCD
 	fclose(vcd);
 #endif
-#endif
-	printf("mfmbits count = %lu\n", mfmbits.size());
 
+	printf("mfmbits count = %lu\n", mfmbits.size());
 
 	// Now process the MFM bitstream to find the sync markers
 	unsigned long bits = 0;
@@ -777,7 +550,6 @@ int main(int argc, char **argv)
 
 	printf("Seen: %d IDAMs, %d DAMs\n", num_idam, num_dam);
 
-	// clean-up
-	delete[] histogram;
+	// clean-up goes here
 	return 0;
 }
