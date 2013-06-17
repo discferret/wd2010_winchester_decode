@@ -85,7 +85,7 @@ class DiscFerretImage {
 		int file_version;
 	public:
 		DiscFerretImage(const char *filename);
-		void NextTrack(vector<int> &timings, vector<int> &indexes, unsigned int &cyl, unsigned int &head, unsigned int &sec);
+		void NextTrack(vector<unsigned int> &timings, vector<unsigned int> &indexes, unsigned int &cyl, unsigned int &head, unsigned int &sec);
 };
 
 DiscFerretImage::DiscFerretImage(const char *filename)
@@ -121,7 +121,7 @@ DiscFerretImage::DiscFerretImage(const char *filename)
 	}
 }
 
-void DiscFerretImage::NextTrack(vector<int> &timings, vector<int> &indexes, unsigned int &cyl, unsigned int &head, unsigned int &sec)
+void DiscFerretImage::NextTrack(vector<unsigned int> &timings, vector<unsigned int> &indexes, unsigned int &cyl, unsigned int &head, unsigned int &sec)
 {
 	uint8_t hdr[10];
 	uint32_t plen;
@@ -241,7 +241,8 @@ void dump_array(unsigned char *d, size_t len)
 }
 
 // data separator -- PJL
-void DataSeparate_PJL(vector<bool> &mfmbits, const unsigned int *const buf, const size_t buflen)
+// TODO: Make this runtime configurable
+void DataSeparate_PJL(vector<bool> &mfmbits, const vector<unsigned int> &buf)
 {
 #ifdef VCD
 	FILE *vcd = fopen("values.vcd", "wt");
@@ -398,7 +399,7 @@ void DataSeparate_PJL(vector<bool> &mfmbits, const unsigned int *const buf, cons
 		fprintf(vcd, " &\n");
 		if (mfmbits.size() == 1000) { printf("Got 1000 bits, terminating run.\n"); break; }
 #endif
-	} while (i < buflen);
+	} while (i < buf.size());
 
 #ifdef VCD
 	fclose(vcd);
@@ -409,34 +410,32 @@ void DataSeparate_PJL(vector<bool> &mfmbits, const unsigned int *const buf, cons
 // main fnc
 int main(int argc, char **argv)
 {
-	unsigned int buf[128*1024];
-	size_t buflen;
-
 	if (argc < 2) {
 		cout << "syntax: " << argv[0] << " filename\n";
 		return -1;
 	}
 
-	// limit scope of 'x'
-	{
-		DiscFerretImage dfi(argv[1]);
+	DiscFerretImage dfi(argv[1]);
 
-		vector<int> timing, index;
-		unsigned int cyl, head, sec;
+	vector<unsigned int> timing, index;
+	unsigned int cyl, head, sec;
 
-		dfi.NextTrack(timing, index, cyl, head, sec);
+	dfi.NextTrack(timing, index, cyl, head, sec);
 
-		buflen = timing.size();
-		for (size_t x=0; x<buflen; x++) {
-			buf[x] = timing[x];
-		}
-
-		printf("DFI track CHS %u:%u:%u; buflen = %lu\n", cyl, head, sec, (unsigned long)buflen);
+	printf("DFI track CHS %u:%u:%u; buflen = %lu\n", cyl, head, sec, timing.size());
+	printf("\tIndexes: ");
+	for (size_t i=0; i<index.size(); i++) {
+		printf("%d\t", index[i]);
 	}
+	printf("\n");
+
+	ofstream outfile;
+	outfile.exceptions(ofstream::failbit | ofstream::badbit);
+	outfile.open("data.bin", ios::out | ios::binary);
 
 	// Data separator begins here.
 	vector<bool> mfmbits;
-	DataSeparate_PJL(mfmbits, buf, buflen);
+	DataSeparate_PJL(mfmbits, timing);
 
 	printf("mfmbits count = %lu\n", mfmbits.size());
 
@@ -445,6 +444,7 @@ int main(int argc, char **argv)
 	unsigned int num_idam = 0, num_dam = 0;
 	size_t next_data_dump = 0;
 	bool chk_data_crc = false;
+	bool is_dam = false;
 	for (size_t i=0; i<mfmbits.size(); i++) {
 		size_t dump=0;
 
@@ -460,6 +460,7 @@ int main(int argc, char **argv)
 			num_idam++;
 			dump = 5;
 			chk_data_crc = false;
+			is_dam = false;
 
 			// decode the IDAM
 			unsigned char *idambuf = new unsigned char[6];
@@ -526,6 +527,7 @@ int main(int argc, char **argv)
 			dump = next_data_dump;
 			next_data_dump = 0;
 			chk_data_crc = true;
+			is_dam = true;
 		}
 
 		if (dump > 0) {
@@ -549,6 +551,10 @@ int main(int argc, char **argv)
 				printf("\tData record CRC=%04X (calc'd %04X) %s\n", (buffer[dump+0] << 8) | buffer[dump+1],
 						crc,
 						((unsigned int)((buffer[dump+0] << 8) | buffer[dump+1])==crc) ? "(ok)" : "BAD");
+			}
+
+			if (is_dam) {
+				outfile.write(reinterpret_cast<char *>(buffer), dump);
 			}
 
 			delete[] buffer;
