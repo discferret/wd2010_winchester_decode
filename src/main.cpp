@@ -317,7 +317,7 @@ void DataSeparate_PJL(vector<bool> &mfmbits, const vector<unsigned int> &buf)
 	const unsigned long NSECS_PER_PLLCK = (1e10 / 640e6);
 	// Number of clock increments per loop (timing granularity). Best-case value
 	// for this is gcd(NSECS_PER_ACQ, NSECS_PER_PLLCK).
-	const unsigned long TIMER_INCREMENT = 1;
+	const unsigned long TIMER_INCREMENT = 5; //1;
 	// Maximum value of the PJL counter. Determines the granularity of phase changes.
 	const unsigned char PJL_COUNTER_MAX = 64;
 
@@ -417,152 +417,164 @@ int main(int argc, char **argv)
 
 	DiscFerretImage dfi(argv[1]);
 
-	vector<unsigned int> timing, index;
-	unsigned int cyl, head, sec;
-
-	dfi.NextTrack(timing, index, cyl, head, sec);
-
-	printf("DFI track CHS %u:%u:%u; buflen = %lu\n", cyl, head, sec, timing.size());
-	printf("\tIndexes: ");
-	for (size_t i=0; i<index.size(); i++) {
-		printf("%d\t", index[i]);
-	}
-	printf("\n");
-
 	ofstream outfile;
 	outfile.exceptions(ofstream::failbit | ofstream::badbit);
 	outfile.open("data.bin", ios::out | ios::binary);
 
-	// Data separator begins here.
-	vector<bool> mfmbits;
-	DataSeparate_PJL(mfmbits, timing);
+	vector<unsigned int> timing, index;
+	unsigned int cyl, head, sec;
 
-	printf("mfmbits count = %lu\n", mfmbits.size());
+	for (;;) {
+		dfi.NextTrack(timing, index, cyl, head, sec);
 
-	// Now process the MFM bitstream to find the sync markers
-	unsigned long bits = 0;
-	unsigned int num_idam = 0, num_dam = 0;
-	size_t next_data_dump = 0;
-	bool chk_data_crc = false;
-	bool is_dam = false;
-	for (size_t i=0; i<mfmbits.size(); i++) {
-		size_t dump=0;
+		if (head == 6) continue;
 
-		// get next bit
-		bits = ((bits << 1) + (mfmbits[i] ? 1 : 0)) & 0xffffffff;
+		printf("DFI track CHS %u:%u:%u; buflen = %lu\n", cyl, head, sec, timing.size());
+//		printf("\tIndexes: ");
+//		for (size_t i=0; i<index.size(); i++) {
+//			printf("%d\t", index[i]);
+//		}
+//		printf("\n");
 
-		// Scan the last 32 MFM-bits (16 data bits) for an MFM pattern we recognise
-		if ((bits & 0xffffFF30) == 0x44895510) {	// Sync-A1, 0b1111_x1xx ==> IDAM  (x=don't care)
-			// ID Address Mark (IDAM)
-			// i+1 because "i" is the last bit of the IDAM marker; we want the
-			// first bit of the new data byte (encoded word).
-			printf("IDAM at %lu\n", i+1);
-			num_idam++;
-			dump = 5;
-			chk_data_crc = false;
-			is_dam = false;
+		// Data separator begins here.
+		vector<bool> mfmbits;
+		DataSeparate_PJL(mfmbits, timing);
 
-			// decode the IDAM
-			unsigned char *idambuf = new unsigned char[6];
-			for (size_t x=0; x<5; x++) {
-				idambuf[x] = decodeMFM(mfmbits, i+(x*16)+1);
-			}
+//		printf("mfmbits count = %lu\n", mfmbits.size());
 
-			// Decode Cylinder from IDENT byte and Cyl_Lo
-			// (the three upper bits are stored in IDENT, rest are in CYL_LO)
-			// Ref: WD2010-05 datasheet page 3-130, Western Digital
-			unsigned int cylinder = 0;
-			cylinder = decodeMFM(mfmbits, i-15);
-			switch (cylinder) {
-				case 0xFE:	cylinder = 0;    break;
-				case 0xFF:	cylinder = 256;  break;
-				case 0xFC:	cylinder = 512;  break;
-				case 0xFD:	cylinder = 768;  break;
-				case 0xF6:	cylinder = 1024; break;
-				case 0xF7:	cylinder = 1280; break;
-				case 0xF4:	cylinder = 1536; break;
-				case 0xF5:	cylinder = 1792; break;
-				default:	cylinder = 0;			// TODO flag error?
-			}
-			cylinder += static_cast<unsigned int>(idambuf[0]);
+		// Now process the MFM bitstream to find the sync markers
+		unsigned long bits = 0;
+		unsigned int num_idam = 0, num_dam = 0;
+		size_t next_data_dump = 0;
+		bool chk_data_crc = false;
+		bool is_dam = false;
+		for (size_t i=0; i<mfmbits.size(); i++) {
+			size_t dump=0;
 
-			printf("\tIDAM = Cylinder %4d, Head %d, Sector %2d; %s; sector size ",
-					cylinder, idambuf[1] & 0x07, idambuf[2],
-					(idambuf[1] & 0x80) ? "BAD BLOCK" : "ok  block");
-			switch ((idambuf[1] >> 5) & 0x03) {
-				case 0x00:
-					next_data_dump = 256;
-					break;
-				case 0x01:
-					next_data_dump = 512;
-					break;
-				case 0x02:
-					next_data_dump = 1024;
-					break;
-				case 0x03:
-					next_data_dump = 128;
-					break;
-				default:
-					printf("unknown (0x%02X)", (idambuf[1] >> 5) & 0x03);
-					next_data_dump = 0;
-					break;
-			}
-			if (next_data_dump != 0) printf("%ld", next_data_dump);
+			// get next bit
+			bits = ((bits << 1) + (mfmbits[i] ? 1 : 0)) & 0xffffffff;
 
-			// check the CRC
-			CRC16 c = CRC16();
-			c.update((char *)"\xA1\xFE", 2);
-			unsigned int crc = c.update(idambuf, 3);
-			unsigned int got_crc = (idambuf[3] << 8) | idambuf[4];
-			printf("; RCRC=%04X", c.update(&idambuf[3], 2));
-			printf("; CRC=%04X (calc'd %04X) %s\n", got_crc, crc, (got_crc==crc) ? "(ok)" : "BAD");
+			// Scan the last 32 MFM-bits (16 data bits) for an MFM pattern we recognise
+			if ((bits & 0xffffFF30) == 0x44895510) {	// Sync-A1, 0b1111_x1xx ==> IDAM  (x=don't care)
+				// ID Address Mark (IDAM)
+				// i+1 because "i" is the last bit of the IDAM marker; we want the
+				// first bit of the new data byte (encoded word).
+//				printf("IDAM at %lu\n", i+1);
+				num_idam++;
+				dump = 5;
+				chk_data_crc = false;
+				is_dam = false;
 
-			delete idambuf;
-		} else if ((bits & 0xffffffff) == 0x4489554A) {		// Sync-A1, 0xF8 ==> DAM
-			// Data Address Mark
-			// i+1 because "i" is the last bit of the DAM marker; we want the
-			// first bit of the new data byte (encoded word).
-			printf("DAM at %lu%s\n", i+1, (next_data_dump == 0) ? " [ERR: no preceding IDAM]" : "");
-			num_dam++;
-			dump = next_data_dump;
-			next_data_dump = 0;
-			chk_data_crc = true;
-			is_dam = true;
-		}
+				// decode the IDAM
+				unsigned char *idambuf = new unsigned char[6];
+				for (size_t x=0; x<5; x++) {
+					idambuf[x] = decodeMFM(mfmbits, i+(x*16)+1);
+				}
 
-		if (dump > 0) {
-			// dump next few bytes of data in hex
-			// TODO: use hex_dump() and a char array instead
-			// i+1 because "i" is the last bit of the (I)DAM marker; we want
-			// the first bit of the new data byte (encoded word).
-			//
-			unsigned char *buffer = new unsigned char[dump+2];
-			const size_t EXTRA=6*0;
-			for (size_t x=0; x<dump+EXTRA; x++) {
-				buffer[x] = decodeMFM(mfmbits, i+(x*16)+1);
-			}
-			hex_dump(buffer, dump+EXTRA);
-			dump_array(buffer, dump+EXTRA);
+				// Decode Cylinder from IDENT byte and Cyl_Lo
+				// (the three upper bits are stored in IDENT, rest are in CYL_LO)
+				// Ref: WD2010-05 datasheet page 3-130, Western Digital
+				unsigned int cylinder = 0;
+				cylinder = decodeMFM(mfmbits, i-15);
+				switch (cylinder) {
+					case 0xFE:	cylinder = 0;    break;
+					case 0xFF:	cylinder = 256;  break;
+					case 0xFC:	cylinder = 512;  break;
+					case 0xFD:	cylinder = 768;  break;
+					case 0xF6:	cylinder = 1024; break;
+					case 0xF7:	cylinder = 1280; break;
+					case 0xF4:	cylinder = 1536; break;
+					case 0xF5:	cylinder = 1792; break;
+					default:	cylinder = 0;			// TODO flag error?
+				}
+				cylinder += static_cast<unsigned int>(idambuf[0]);
+/*
+				printf("\tIDAM = Cylinder %4d, Head %d, Sector %2d; %s; sector size ",
+						cylinder, idambuf[1] & 0x07, idambuf[2],
+						(idambuf[1] & 0x80) ? "BAD BLOCK" : "ok  block");
+*/
+				switch ((idambuf[1] >> 5) & 0x03) {
+					case 0x00:
+						next_data_dump = 256;
+						break;
+					case 0x01:
+						next_data_dump = 512;
+						break;
+					case 0x02:
+						next_data_dump = 1024;
+						break;
+					case 0x03:
+						next_data_dump = 128;
+						break;
+					default:
+//						printf("unknown (0x%02X)", (idambuf[1] >> 5) & 0x03);
+						next_data_dump = 0;
+						break;
+				}
+//				if (next_data_dump != 0) printf("%ld", next_data_dump);
 
-			if (chk_data_crc) {
+				// check the CRC
 				CRC16 c = CRC16();
-				c.update((char *)"\xA1\xF8", 2);
-				unsigned int crc = c.update(buffer, dump);
-				printf("\tData record CRC=%04X (calc'd %04X) %s\n", (buffer[dump+0] << 8) | buffer[dump+1],
-						crc,
-						((unsigned int)((buffer[dump+0] << 8) | buffer[dump+1])==crc) ? "(ok)" : "BAD");
+				c.update((char *)"\xA1\xFE", 2);
+				unsigned int crc = c.update(idambuf, 3);
+				unsigned int got_crc = (idambuf[3] << 8) | idambuf[4];
+//				printf("; RCRC=%04X", c.update(&idambuf[3], 2));
+//				printf("; CRC=%04X (calc'd %04X) %s\n", got_crc, crc, (got_crc==crc) ? "(ok)" : "BAD");
+
+				delete idambuf;
+			} else if ((bits & 0xffffffff) == 0x4489554A) {		// Sync-A1, 0xF8 ==> DAM
+				// Data Address Mark
+				// i+1 because "i" is the last bit of the DAM marker; we want the
+				// first bit of the new data byte (encoded word).
+//				printf("DAM at %lu%s\n", i+1, (next_data_dump == 0) ? " [ERR: no preceding IDAM]" : "");
+				num_dam++;
+				dump = next_data_dump;
+				next_data_dump = 0;
+				chk_data_crc = true;
+				is_dam = true;
 			}
 
-			if (is_dam) {
-				outfile.write(reinterpret_cast<char *>(buffer), dump);
-			}
+			if (dump > 0) {
+				// dump next few bytes of data in hex
+				// TODO: use hex_dump() and a char array instead
+				// i+1 because "i" is the last bit of the (I)DAM marker; we want
+				// the first bit of the new data byte (encoded word).
+				//
+				const size_t EXTRA=2;
+				unsigned char *buffer = new unsigned char[dump+EXTRA];
+				for (size_t x=0; x<dump+EXTRA; x++) {
+					buffer[x] = decodeMFM(mfmbits, i+(x*16)+1);
+				}
+				//hex_dump(buffer, dump+EXTRA);
+				//dump_array(buffer, dump+EXTRA);
 
-			delete[] buffer;
+				if (chk_data_crc) {
+					CRC16 c = CRC16();
+					c.update((char *)"\xA1\xF8", 2);
+					unsigned int crc = c.update(buffer, dump);
+//					printf("\tData record CRC=%04X (calc'd %04X) %s\n", (buffer[dump+0] << 8) | buffer[dump+1],
+//							crc,
+//							((unsigned int)((buffer[dump+0] << 8) | buffer[dump+1])==crc) ? "(ok)" : "BAD");
+					if ((unsigned int)((buffer[dump+0] << 8) | buffer[dump+1]) != crc) {
+						printf("WARNING -- bad data area CRC\n");
+					}
+				}
+
+				if (is_dam) {
+					outfile.write(reinterpret_cast<char *>(buffer), dump);
+					outfile.flush();
+				}
+
+				delete[] buffer;
+			}
+		}
+		if (num_dam != num_idam) {
+			printf("WARNING -- IDAM/DAM count mismatch -- seen %d IDAMs, %d DAMs\n", num_idam, num_dam);
 		}
 	}
 
-	printf("Seen: %d IDAMs, %d DAMs\n", num_idam, num_dam);
-
 	// clean-up goes here
+	outfile.close();
+
 	return 0;
 }
